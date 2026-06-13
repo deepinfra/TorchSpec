@@ -15,8 +15,7 @@ spec:
       parameters:
       - { name: image,     value: "localhost:30500/torchspec:0.1.0-deploy" }
       - { name: node }                       # reserved trainer node (kubernetes.io/hostname)
-      - { name: gpu_uuids }                  # 4 UUIDs, comma-separated, from reserve_gpus
-      - { name: num_gpus,  value: "4" }
+      - { name: gpu_uuids }                  # comma-separated UUIDs; count == training GPUs (auto)
     metadata:
       labels: { app: torchspec, torchspec/role: head, model_manager_managed: "true" }
     podSpecPatch: |
@@ -32,9 +31,10 @@ spec:
       image: "{{inputs.parameters.image}}"
       workingDir: /root/torchspec
       command: ["bash", "-lc"]
-      args:
+      args:                                                                          # --num-gpus = count of UUIDs in NVIDIA_VISIBLE_DEVICES
       - >
-        ray start --head --port 6380 --num-gpus {{inputs.parameters.num_gpus}}
+        NG=$(echo "$NVIDIA_VISIBLE_DEVICES" | tr ',' '\n' | grep -c .);
+        ray start --head --port 6380 --num-gpus "$NG"
         --temp-dir /tmp/ray_$(id -u) --disable-usage-stats --block
       env:
       - { name: NVIDIA_VISIBLE_DEVICES, value: "{{inputs.parameters.gpu_uuids}}" }   # no nvidia.com/gpu request — matches production
@@ -60,9 +60,8 @@ spec:
       parameters:
       - { name: image,     value: "localhost:30500/torchspec:0.1.0-deploy" }
       - { name: node }                       # reserved inference node
-      - { name: gpu_uuids }                  # 2 UUIDs for this node
+      - { name: gpu_uuids }                  # comma-separated UUIDs; count == GPUs on this node (auto)
       - { name: head_ip }                    # head pod IP (== trainer node IP)
-      - { name: num_gpus,  value: "2" }
     metadata:
       labels: { app: torchspec, torchspec/role: worker, model_manager_managed: "true" }
     podSpecPatch: |
@@ -78,9 +77,10 @@ spec:
       image: "{{inputs.parameters.image}}"
       workingDir: /root/torchspec
       command: ["bash", "-lc"]
-      args:
+      args:                                                                          # --num-gpus = count of UUIDs in NVIDIA_VISIBLE_DEVICES
       - >
-        ray start --address {{inputs.parameters.head_ip}}:6380 --num-gpus {{inputs.parameters.num_gpus}}
+        NG=$(echo "$NVIDIA_VISIBLE_DEVICES" | tr ',' '\n' | grep -c .);
+        ray start --address {{inputs.parameters.head_ip}}:6380 --num-gpus "$NG"
         --temp-dir /tmp/ray_$(id -u) --disable-usage-stats --block
       env:
       - { name: NVIDIA_VISIBLE_DEVICES, value: "{{inputs.parameters.gpu_uuids}}" }
@@ -110,11 +110,10 @@ spec:
       - { name: gpu_uuids }                  # trainer UUIDs (visibility parity with the original single-container run)
       - { name: head_ip }
       - { name: training_node_ips }          # e.g. "[<head_ip>]"
-      - { name: inference_node_ips }         # e.g. "[<w1>,<w2>,<w3>]"
+      - { name: inference_node_ips }         # e.g. "[<w1>,<w2>,<w3>]"   (from gate)
+      - { name: infer_gpus }                 # total inference GPUs       (from gate)
+      - { name: infer_gpus_per_node }        # GPUs per inference node    (from gate)
       - { name: train_nodes,          value: "1" }
-      - { name: train_gpus,           value: "4" }
-      - { name: infer_gpus,           value: "6" }
-      - { name: infer_gpus_per_node,  value: "2" }
       - { name: tp_size,              value: "2" }
       - { name: mem_fraction,         value: "0.8" }
       - { name: mooncake_segment,     value: "128GB" }
@@ -136,10 +135,11 @@ spec:
       image: "{{inputs.parameters.image}}"
       workingDir: /root/torchspec
       command: ["bash", "-lc"]
-      args:
+      args:                                                                          # TRAIN_GPUS = count of UUIDs in NVIDIA_VISIBLE_DEVICES
       - >
+        NG=$(echo "$NVIDIA_VISIBLE_DEVICES" | tr ',' '\n' | grep -c .);
         TRAIN_NODES={{inputs.parameters.train_nodes}}
-        TRAIN_GPUS={{inputs.parameters.train_gpus}}
+        TRAIN_GPUS="$NG"
         INFERENCE_GPUS={{inputs.parameters.infer_gpus}}
         INFERENCE_GPUS_PER_NODE={{inputs.parameters.infer_gpus_per_node}}
         TP_SIZE={{inputs.parameters.tp_size}}
@@ -203,11 +203,11 @@ spec:
   - name: gate-and-discover
     inputs:
       parameters:
-      - { name: image,          value: "localhost:30500/torchspec:0.1.0-deploy" }
+      - { name: image,        value: "localhost:30500/torchspec:0.1.0-deploy" }
       - { name: node }                       # trainer node (same as head)
       - { name: head_ip }
-      - { name: expected_nodes, value: "4" } # 1 head + N workers
-      - { name: timeout_secs,   value: "900" }
+      - { name: worker_specs }               # same JSON the DAG fans out over; count → expected workers
+      - { name: timeout_secs, value: "900" }
     podSpecPatch: |
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
@@ -217,19 +217,23 @@ spec:
       parameters:
       - name: inference_node_ips             # "[ip1,ip2,ip3]" — feeds train.inference_node_ips
         valueFrom: { path: /tmp/inference_node_ips }
+      - name: infer_gpus                     # total inference GPUs — feeds train.infer_gpus
+        valueFrom: { path: /tmp/infer_gpus }
+      - name: infer_gpus_per_node            # GPUs per inference node — feeds train.infer_gpus_per_node
+        valueFrom: { path: /tmp/infer_gpus_per_node }
     script:
       image: "{{inputs.parameters.image}}"
       command: ["python3"]
       env:
-      - { name: RAY_ADDRESS,     value: "{{inputs.parameters.head_ip}}:6380" }
-      - { name: HEAD_IP,         value: "{{inputs.parameters.head_ip}}" }
-      - { name: EXPECTED_NODES,  value: "{{inputs.parameters.expected_nodes}}" }
-      - { name: TIMEOUT_SECS,    value: "{{inputs.parameters.timeout_secs}}" }
+      - { name: RAY_ADDRESS,  value: "{{inputs.parameters.head_ip}}:6380" }
+      - { name: HEAD_IP,      value: "{{inputs.parameters.head_ip}}" }
+      - { name: WORKER_SPECS, value: "{{inputs.parameters.worker_specs}}" }
+      - { name: TIMEOUT_SECS, value: "{{inputs.parameters.timeout_secs}}" }
       source: |
-        import os, sys, time, ray
+        import os, sys, time, json, ray
         addr = os.environ["RAY_ADDRESS"]
         head_ip = os.environ["HEAD_IP"]
-        expected = int(os.environ["EXPECTED_NODES"])
+        expected = len(json.loads(os.environ["WORKER_SPECS"])) + 1   # workers + head
         deadline = time.time() + int(os.environ["TIMEOUT_SECS"])
         ray.init(address=addr)
         while True:
@@ -242,9 +246,21 @@ spec:
                 sys.exit(1)
             time.sleep(5)
         # workers = every live node except the head
-        worker_ips = [n["NodeManagerAddress"] for n in alive
-                      if n["NodeManagerAddress"] != head_ip]
-        out = "[" + ",".join(worker_ips) + "]"
-        with open("/tmp/inference_node_ips", "w") as f:
-            f.write(out)
-        print("cluster ready: %d nodes; inference_node_ips=%s" % (len(alive), out))
+        workers = [n for n in alive if n["NodeManagerAddress"] != head_ip]
+        worker_ips = [n["NodeManagerAddress"] for n in workers]
+        gpus_per = [int(n.get("Resources", {}).get("GPU", 0)) for n in workers]
+        per_node = gpus_per[0] if gpus_per else 0
+        if any(g != per_node for g in gpus_per):
+            sys.stderr.write(
+                "ERROR: non-uniform inference GPU counts %s; run.sh needs a constant "
+                "INFERENCE_GPUS_PER_NODE\n" % gpus_per)
+            sys.exit(1)
+        infer_gpus = sum(gpus_per)
+        inference_node_ips = "[" + ",".join(worker_ips) + "]"
+        for path, val in [("/tmp/inference_node_ips", inference_node_ips),
+                          ("/tmp/infer_gpus", str(infer_gpus)),
+                          ("/tmp/infer_gpus_per_node", str(per_node))]:
+            with open(path, "w") as f:
+                f.write(val)
+        print("cluster ready: %d nodes; inference_node_ips=%s infer_gpus=%d per_node=%d"
+              % (len(alive), inference_node_ips, infer_gpus, per_node))
