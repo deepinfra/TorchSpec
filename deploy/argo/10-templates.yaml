@@ -167,9 +167,9 @@ spec:
   - name: convert-to-hf
     inputs:
       parameters:
-      - { name: image,     value: "localhost:30500/torchspec:0.1.0-deploy" }
+      - { name: image,      value: "localhost:30500/torchspec:0.1.0-deploy" }
       - { name: node }                       # trainer node (where checkpoints live on /data)
-      - { name: input_dir }                  # e.g. /data/torchspec-outputs/my_experiment/iter_0010000/
+      - { name: output_dir }                 # experiment dir under /data containing iter_* subdirs
     metadata:
       labels: { app: torchspec, torchspec/role: convert, model_manager_managed: "true" }
     podSpecPatch: |
@@ -184,7 +184,67 @@ spec:
       image: "{{inputs.parameters.image}}"
       workingDir: /root/torchspec
       command: ["bash", "-lc"]
-      args:
-      - "python tools/convert_to_hf.py --input-dir {{inputs.parameters.input_dir}}"
+      args:                                  # pick the latest iter_* checkpoint (zero-padded → lexical sort == numeric)
+      - >
+        base="{{inputs.parameters.output_dir}}";
+        last="$(ls -d "$base"/iter_* 2>/dev/null | sort | tail -n1)";
+        if [ -z "$last" ]; then echo "no iter_* checkpoint under $base" >&2; exit 1; fi;
+        echo "converting latest checkpoint: $last";
+        python tools/convert_to_hf.py --input-dir "$last"
       volumeMounts:
       - { name: data, mountPath: /data }
+
+  # ─────────────────────────────────────────────────────────────
+  # Readiness gate + IP discovery. Waits until the Ray cluster has the
+  # expected number of live nodes, then emits the worker IPs formatted
+  # as run.sh's inference_node_ips (e.g. "[ip1,ip2,ip3]").
+  # Runs on the trainer node; connects to the head GCS as a driver.
+  # ─────────────────────────────────────────────────────────────
+  - name: gate-and-discover
+    inputs:
+      parameters:
+      - { name: image,          value: "localhost:30500/torchspec:0.1.0-deploy" }
+      - { name: node }                       # trainer node (same as head)
+      - { name: head_ip }
+      - { name: expected_nodes, value: "4" } # 1 head + N workers
+      - { name: timeout_secs,   value: "900" }
+    podSpecPatch: |
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: "{{inputs.parameters.node}}"
+    outputs:
+      parameters:
+      - name: inference_node_ips             # "[ip1,ip2,ip3]" — feeds train.inference_node_ips
+        valueFrom: { path: /tmp/inference_node_ips }
+    script:
+      image: "{{inputs.parameters.image}}"
+      command: ["python3"]
+      env:
+      - { name: RAY_ADDRESS,     value: "{{inputs.parameters.head_ip}}:6380" }
+      - { name: HEAD_IP,         value: "{{inputs.parameters.head_ip}}" }
+      - { name: EXPECTED_NODES,  value: "{{inputs.parameters.expected_nodes}}" }
+      - { name: TIMEOUT_SECS,    value: "{{inputs.parameters.timeout_secs}}" }
+      source: |
+        import os, sys, time, ray
+        addr = os.environ["RAY_ADDRESS"]
+        head_ip = os.environ["HEAD_IP"]
+        expected = int(os.environ["EXPECTED_NODES"])
+        deadline = time.time() + int(os.environ["TIMEOUT_SECS"])
+        ray.init(address=addr)
+        while True:
+            alive = [n for n in ray.nodes() if n.get("Alive")]
+            if len(alive) >= expected:
+                break
+            if time.time() > deadline:
+                sys.stderr.write(
+                    "timeout: only %d/%d ray nodes alive\n" % (len(alive), expected))
+                sys.exit(1)
+            time.sleep(5)
+        # workers = every live node except the head
+        worker_ips = [n["NodeManagerAddress"] for n in alive
+                      if n["NodeManagerAddress"] != head_ip]
+        out = "[" + ",".join(worker_ips) + "]"
+        with open("/tmp/inference_node_ips", "w") as f:
+            f.write(out)
+        print("cluster ready: %d nodes; inference_node_ips=%s" % (len(alive), out))

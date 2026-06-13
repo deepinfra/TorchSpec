@@ -1,0 +1,27 @@
+# ─────────────────────────────────────────────────────────────────────────
+# Per-run parameters for 20-workflow.yaml
+#   argo submit deploy/argo/20-workflow.yaml --parameter-file deploy/argo/run_params.yaml
+#
+# Topology: 1 trainer (4 GPU, FSDP) + 3 inference nodes (2 GPU each) = expected_nodes 4.
+#
+# IMPORTANT — GPU values below are device INDICES taken from your allocation
+# notes. NVIDIA_VISIBLE_DEVICES accepts indices OR UUIDs, so these work, but the
+# production-safe path is to run `i reserve` first and paste the returned GPU
+# UUIDs here instead (UUIDs are stable; indices can be reordered by the driver).
+# Also keep the reservation holder pods alive for the whole run.
+# ─────────────────────────────────────────────────────────────────────────
+
+# ── Trainer (Ray head, 4 GPU) ──
+trainer_node: "<TRAINER_NODE>"            # e.g. di-slc-110
+trainer_uuids: "<UUID1,UUID2,UUID3,UUID4>"   # 4 reserved GPU UUIDs from `i reserve`
+
+# ── Inference workers (Ray workers, 2 GPU each, one entry per node) ──
+# JSON array string so the DAG's withParam can fan out over it.
+worker_specs: '[{"node":"<INFER_NODE_1>","uuids":"<UUID_A,UUID_B>"},{"node":"<INFER_NODE_2>","uuids":"<UUID_C,UUID_D>"},{"node":"<INFER_NODE_3>","uuids":"<UUID_E,UUID_F>"}]'
+
+# ── Topology / misc ──
+expected_nodes: "4"               # 1 head + 3 workers; bump if you change the worker count
+image: "localhost:30500/torchspec:0.1.0-deploy"
+
+# ── Checkpoint conversion: experiment dir under /data; convert picks the latest iter_* ──
+convert_output_dir: "/data/torchspec-outputs/my_experiment"
