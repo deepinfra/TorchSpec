@@ -1,0 +1,190 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: torchspec-templates
+  namespace: deepinfra
+spec:
+  templates:
+
+  # ─────────────────────────────────────────────────────────────
+  # Ray head (trainer). Daemon: stays up for the workflow, auto-torn-down.
+  # ─────────────────────────────────────────────────────────────
+  - name: ray-head
+    daemon: true
+    inputs:
+      parameters:
+      - { name: image,     value: "localhost:30500/torchspec:0.1.0-deploy" }
+      - { name: node }                       # reserved trainer node (kubernetes.io/hostname)
+      - { name: gpu_uuids }                  # 4 UUIDs, comma-separated, from reserve_gpus
+      - { name: num_gpus,  value: "4" }
+    metadata:
+      labels: { app: torchspec, torchspec/role: head, model_manager_managed: "true" }
+    podSpecPatch: |
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: "{{inputs.parameters.node}}"
+      volumes:
+      - name: data
+        hostPath: { path: /data, type: Directory }
+    container:
+      image: "{{inputs.parameters.image}}"
+      workingDir: /root/torchspec
+      command: ["bash", "-lc"]
+      args:
+      - >
+        ray start --head --port 6380 --num-gpus {{inputs.parameters.num_gpus}}
+        --temp-dir /tmp/ray_$(id -u) --disable-usage-stats --block
+      env:
+      - { name: NVIDIA_VISIBLE_DEVICES, value: "{{inputs.parameters.gpu_uuids}}" }   # no nvidia.com/gpu request — matches production
+      - name: MC_TCP_BIND_ADDRESS
+        valueFrom: { fieldRef: { fieldPath: status.podIP } }                          # == node IP under hostNetwork
+      securityContext:
+        capabilities: { add: [IPC_LOCK, SYS_NICE] }                                  # IPC_LOCK also covers old --ulimit memlock=-1
+      volumeMounts:
+      - { name: data, mountPath: /data }
+      readinessProbe:                                                                # "ready" only when the GCS actually answers
+        exec: { command: ["bash", "-lc", "ray status >/dev/null 2>&1"] }
+        initialDelaySeconds: 5
+        periodSeconds: 5
+        failureThreshold: 60
+        timeoutSeconds: 5
+
+  # ─────────────────────────────────────────────────────────────
+  # Ray worker (inference node). Daemon. Attaches to the head.
+  # ─────────────────────────────────────────────────────────────
+  - name: ray-worker
+    daemon: true
+    inputs:
+      parameters:
+      - { name: image,     value: "localhost:30500/torchspec:0.1.0-deploy" }
+      - { name: node }                       # reserved inference node
+      - { name: gpu_uuids }                  # 2 UUIDs for this node
+      - { name: head_ip }                    # head pod IP (== trainer node IP)
+      - { name: num_gpus,  value: "2" }
+    metadata:
+      labels: { app: torchspec, torchspec/role: worker, model_manager_managed: "true" }
+    podSpecPatch: |
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: "{{inputs.parameters.node}}"
+      volumes:
+      - name: data
+        hostPath: { path: /data, type: Directory }
+    container:
+      image: "{{inputs.parameters.image}}"
+      workingDir: /root/torchspec
+      command: ["bash", "-lc"]
+      args:
+      - >
+        ray start --address {{inputs.parameters.head_ip}}:6380 --num-gpus {{inputs.parameters.num_gpus}}
+        --temp-dir /tmp/ray_$(id -u) --disable-usage-stats --block
+      env:
+      - { name: NVIDIA_VISIBLE_DEVICES, value: "{{inputs.parameters.gpu_uuids}}" }
+      - name: MC_TCP_BIND_ADDRESS
+        valueFrom: { fieldRef: { fieldPath: status.podIP } }
+      - { name: RAY_ADDRESS, value: "{{inputs.parameters.head_ip}}:6380" }            # used by the readiness probe
+      securityContext:
+        capabilities: { add: [IPC_LOCK, SYS_NICE] }
+      volumeMounts:
+      - { name: data, mountPath: /data }
+      readinessProbe:                                                                # "ready" once this worker can reach the cluster
+        exec: { command: ["bash", "-lc", "ray status >/dev/null 2>&1"] }
+        initialDelaySeconds: 5
+        periodSeconds: 5
+        failureThreshold: 60
+        timeoutSeconds: 5
+
+  # ─────────────────────────────────────────────────────────────
+  # Training driver. Runs to completion; its exit code = run status.
+  # Connects to the Ray cluster as a driver (actors run in the raylets).
+  # ─────────────────────────────────────────────────────────────
+  - name: train
+    inputs:
+      parameters:
+      - { name: image,                value: "localhost:30500/torchspec:0.1.0-deploy" }
+      - { name: node }                       # pin to the trainer node (same as head)
+      - { name: gpu_uuids }                  # trainer UUIDs (visibility parity with the original single-container run)
+      - { name: head_ip }
+      - { name: training_node_ips }          # e.g. "[<head_ip>]"
+      - { name: inference_node_ips }         # e.g. "[<w1>,<w2>,<w3>]"
+      - { name: train_nodes,          value: "1" }
+      - { name: train_gpus,           value: "4" }
+      - { name: infer_gpus,           value: "6" }
+      - { name: infer_gpus_per_node,  value: "2" }
+      - { name: tp_size,              value: "2" }
+      - { name: mem_fraction,         value: "0.8" }
+      - { name: mooncake_segment,     value: "128GB" }
+      - { name: run_script,           value: "./examples/minimax-m27-4node-b200/run.sh" }
+      - { name: config,               value: "configs/sglang_minimax_m27_4node.yaml" }
+      - { name: draft_config,         value: "configs/draft_models/minimax_m27_eagle3.json" }
+    metadata:
+      labels: { app: torchspec, torchspec/role: train, model_manager_managed: "true" }
+    podSpecPatch: |
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: "{{inputs.parameters.node}}"
+      volumes:
+      - name: data
+        hostPath: { path: /data, type: Directory }
+    container:
+      image: "{{inputs.parameters.image}}"
+      workingDir: /root/torchspec
+      command: ["bash", "-lc"]
+      args:
+      - >
+        TRAIN_NODES={{inputs.parameters.train_nodes}}
+        TRAIN_GPUS={{inputs.parameters.train_gpus}}
+        INFERENCE_GPUS={{inputs.parameters.infer_gpus}}
+        INFERENCE_GPUS_PER_NODE={{inputs.parameters.infer_gpus_per_node}}
+        TP_SIZE={{inputs.parameters.tp_size}}
+        {{inputs.parameters.run_script}} {{inputs.parameters.config}}
+        model.draft_model_config={{inputs.parameters.draft_config}}
+        mooncake.global_segment_size={{inputs.parameters.mooncake_segment}}
+        mooncake.protocol=tcp
+        training.placement_strategy=custom
+        training.training_node_ips={{inputs.parameters.training_node_ips}}
+        inference.sglang.mem_fraction_static={{inputs.parameters.mem_fraction}}
+        inference.inference_node_ips={{inputs.parameters.inference_node_ips}}
+      env:
+      - { name: NVIDIA_VISIBLE_DEVICES, value: "{{inputs.parameters.gpu_uuids}}" }
+      - { name: RAY_ADDRESS,            value: "{{inputs.parameters.head_ip}}:6380" }
+      - name: MC_TCP_BIND_ADDRESS
+        valueFrom: { fieldRef: { fieldPath: status.podIP } }
+      securityContext:
+        capabilities: { add: [IPC_LOCK, SYS_NICE] }
+      volumeMounts:
+      - { name: data, mountPath: /data }
+
+  # ─────────────────────────────────────────────────────────────
+  # Checkpoint conversion to HF. Runs after train; reads from /data.
+  # ─────────────────────────────────────────────────────────────
+  - name: convert-to-hf
+    inputs:
+      parameters:
+      - { name: image,     value: "localhost:30500/torchspec:0.1.0-deploy" }
+      - { name: node }                       # trainer node (where checkpoints live on /data)
+      - { name: input_dir }                  # e.g. /data/torchspec-outputs/my_experiment/iter_0010000/
+    metadata:
+      labels: { app: torchspec, torchspec/role: convert, model_manager_managed: "true" }
+    podSpecPatch: |
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        kubernetes.io/hostname: "{{inputs.parameters.node}}"
+      volumes:
+      - name: data
+        hostPath: { path: /data, type: Directory }
+    container:
+      image: "{{inputs.parameters.image}}"
+      workingDir: /root/torchspec
+      command: ["bash", "-lc"]
+      args:
+      - "python tools/convert_to_hf.py --input-dir {{inputs.parameters.input_dir}}"
+      volumeMounts:
+      - { name: data, mountPath: /data }
