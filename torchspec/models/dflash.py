@@ -26,7 +26,7 @@ and cross-entropy loss with exponential decay weighting.
 Matches SpecForge's OnlineDFlashModel (specforge/core/dflash.py).
 """
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -109,6 +109,8 @@ class DFlashModel(nn.Module):
         loss_objective: str = "decay",
         dpace_alpha: float = 0.5,
         loss_decay_gamma: float = 7.0,
+        ce_loss_alpha: float = 1.0,
+        l1_loss_alpha: float = 0.0,
     ):
         super().__init__()
         loss_objective = loss_objective.lower()
@@ -126,6 +128,8 @@ class DFlashModel(nn.Module):
         self.loss_objective = loss_objective
         self.dpace_alpha = dpace_alpha
         self.loss_decay_gamma = loss_decay_gamma
+        self.ce_loss_alpha = float(ce_loss_alpha)
+        self.l1_loss_alpha = float(l1_loss_alpha)
 
     def _sample_anchor_positions(
         self,
@@ -239,26 +243,25 @@ class DFlashModel(nn.Module):
 
         return self.draft_model.embed_tokens(noise_ids)
 
-    def forward(
+    def _draft_backbone(
         self,
         input_ids: torch.Tensor,
         hidden_states_list: List[torch.Tensor],
         loss_mask: torch.Tensor,
-        lm_head_weight: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Full DFlash training forward pass.
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """
+        Shared DFlash backbone (context features → anchor sampling → noise
+        embedding → position ids → block-causal mask → draft model forward).
 
-        Matches SpecForge's OnlineDFlashModel.forward().
+        Both ``DFlashModel.forward`` and ``DSparkModel.forward`` build the draft
+        hidden states this exact way; only the label/loss tail differs. Keeping
+        the attention/mask/anchor wiring here gives it a single source of truth.
 
         Returns:
-            loss: scalar training loss (objective-weighted)
-            accuracy: scalar accuracy (binary mask, no decay)
-            loss_per_position: [block_size] mean loss at each within-block position
-                (index 0 is the anchor slot and always 0; indices 1..B-1 are the
-                predicted tokens at 1..B-1 steps past the anchor)
-            acc_per_position: [block_size] mean accuracy at each within-block position
-            count_per_position: [block_size] valid label count at each within-block
-                position before loss decay is applied
+            draft_hidden: [B, n_blocks*block_size, D] pre-loss draft hidden states
+            anchor_positions: [B, n_blocks] sampled anchor positions
+            block_keep_mask: [B, n_blocks] bool validity of each anchor slot
+            n_blocks: number of anchor slots (== num_anchors)
         """
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -311,6 +314,39 @@ class DFlashModel(nn.Module):
             noise_embedding=noise_embedding,
         )
 
+        return draft_hidden, anchor_positions, block_keep_mask, n_blocks
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states_list: List[torch.Tensor],
+        loss_mask: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        last_hidden_states: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+        """
+        Full DFlash training forward pass.
+
+        Returns:
+            loss: scalar training loss (objective-weighted)
+            accuracy: scalar accuracy (binary mask, no decay)
+            loss_per_position: [block_size] mean loss at each within-block position
+                (index 0 is the anchor slot and always 0; indices 1..B-1 are the
+                predicted tokens at 1..B-1 steps past the anchor)
+            acc_per_position: [block_size] mean accuracy at each within-block position
+            count_per_position: [block_size] valid label count at each within-block
+                position before loss decay is applied
+            loss_components: dict of extra per-component loss scalars for logging
+                (empty for the base DFlash objective; populated by subclasses).
+        """
+        bsz, seq_len = input_ids.shape
+        device = input_ids.device
+
+        # 1-6. Shared backbone → draft hidden states + anchor bookkeeping.
+        draft_hidden, anchor_positions, block_keep_mask, n_blocks = self._draft_backbone(
+            input_ids, hidden_states_list, loss_mask
+        )
+
         # 7. Compute logits via frozen LM head
         logits = (
             self.draft_model.lm_head(draft_hidden)
@@ -352,11 +388,31 @@ class DFlashModel(nn.Module):
         # our objective weighting is an addition to the training signal, not the metric.
         binary_eval_mask = weight_mask.view(-1)
 
-        # 9. Cross entropy loss
-        flat_logits = logits.view(-1, logits.size(-1))
+        # 9. Per-token loss: ce_loss_alpha*CE + l1_loss_alpha*L1.
+        vocab_size = logits.size(-1)
+        flat_logits = logits.view(-1, vocab_size)
         flat_targets = target_ids.view(-1)
-        loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
-        loss_per_token_by_position = loss_per_token.view(bsz, n_blocks, self.block_size)
+        ce_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
+
+        loss_per_token = self.ce_loss_alpha * ce_per_token
+        if self.l1_loss_alpha > 0:
+            if last_hidden_states is None:
+                raise ValueError(
+                    "DFlash L1 distillation (l1_loss_alpha > 0) requires target "
+                    "last_hidden_states; set inference.store_last_hidden_states=true in the "
+                    "run config."
+                )
+            tgt_idx = (safe_label_indices - 1).clamp(min=0)  # [B, n_blocks, block_size]
+            hdim = last_hidden_states.size(-1)
+            gather_idx = tgt_idx.reshape(bsz, -1, 1).expand(-1, -1, hdim)
+            aligned_hidden = torch.gather(last_hidden_states, 1, gather_idx)
+            target_logits = F.linear(aligned_hidden, lm_head_weight).view(-1, vocab_size)
+            target_probs = torch.softmax(target_logits.float(), dim=-1)
+            draft_probs = torch.softmax(flat_logits.float(), dim=-1)
+            l1_per_token = (draft_probs - target_probs).abs().sum(dim=-1)
+            loss_per_token = loss_per_token + self.l1_loss_alpha * l1_per_token
+
+        loss_per_token_by_position = ce_per_token.view(bsz, n_blocks, self.block_size)
 
         objective_weights = weight_mask
         if (
@@ -398,11 +454,19 @@ class DFlashModel(nn.Module):
             count_per_position = binary_weights.sum(dim=(0, 1))
             count_per_pos = count_per_position.clamp(min=1.0)
 
-            loss_per_position = (
-                loss_per_token.view(bsz, n_blocks, self.block_size) * binary_weights
-            ).sum(dim=(0, 1)) / count_per_pos
+            loss_per_position = (loss_per_token_by_position * binary_weights).sum(
+                dim=(0, 1)
+            ) / count_per_pos
             acc_per_position = (correct.view(bsz, n_blocks, self.block_size).float()).sum(
                 dim=(0, 1)
             ) / count_per_pos
 
-        return loss, accuracy, loss_per_position, acc_per_position, count_per_position
+        loss_components = {}
+        return (
+            loss,
+            accuracy,
+            loss_per_position,
+            acc_per_position,
+            count_per_position,
+            loss_components,
+        )
